@@ -1,0 +1,118 @@
+Conductor Study Plan
+This plan is structured as layers — each phase builds on the last. You cannot understand the orchestration layer until you understand the state layer. Don't skip ahead.
+
+Phase 1 — Understand the data that flows through everything
+Goal: Before looking at any agent or API code, understand what information the system moves around. Every other file exists to create, transform, or store this data.
+
+Files to read:
+
+src/agents/state.py — Read this first and read it carefully. This is the AgentState TypedDict. Draw it out on paper: what fields exist, who sets each one, what their types are. Pay special attention to line 43 — Annotated[List[ResearchItem], operator.add]. This is not standard Python; it's a LangGraph instruction that says "append, don't replace." Understand why that matters for the Researcher loop.
+src/db/models.py — This is the database version of a run. Notice it's not the same as AgentState. AgentState lives in memory during a run. AgentRun lives in Postgres before, during, and after. Map out which fields correspond between them.
+What you should be able to answer after this phase:
+
+What are the 10 fields in AgentState and what does each hold?
+Why does research_items use operator.add while research_plan doesn't?
+What is the difference between AgentState and AgentRun? Why do both exist?
+Phase 2 — Understand the agents (the actual AI work)
+Goal: Understand what each agent does as a Python function, independent of LangGraph. Each agent is just a function that takes state and returns a dict — you can understand this without knowing how LangGraph wires them together.
+
+Files to read:
+
+src/agents/tools.py — Short file. Understand what @tool does (it wraps a Python function so LangGraph/LangChain can call it). Understand why web_search returns a formatted string instead of a structured object.
+src/agents/nodes.py — Read each function in isolation. For each one, identify: (a) what it reads from state, (b) what it calls (LLM, tool, or both), (c) what it returns. Notice that every node returns a partial dict, never the full state. This is the most important mechanical rule in LangGraph.
+Study researcher_node (lines 110–162) most carefully. It's the most complex: it uses research_index as a pointer into research_plan, calls a tool, calls an LLM, returns [research_item] (a list with one item), and increments the index. The operator.add from Phase 1 is what makes returning a single-item list correct — LangGraph appends it to the growing list.
+
+Study should_continue_research (lines 169–182). This is not a node — it's a routing function. It returns a string, and that string determines which node runs next. This is the entire mechanism behind the loop.
+
+What you should be able to answer:
+
+Trace a single call to researcher_node for question index 2 of 4. What does state look like before? What does the returned dict look like? What does state look like after LangGraph merges it?
+What would happen if researcher_node returned research_items: research_item (not wrapped in a list)?
+Why does planner_node have a try/except around json.loads? What happens if parsing fails?
+Phase 3 — Understand the graph (how agents are wired together)
+Goal: Understand LangGraph's job: it takes the functions you wrote in Phase 2 and wires them into a controlled execution sequence with looping.
+
+File to read:
+
+src/graphs/workflow.py — Focus on build_graph() first (lines 35–74), ignoring the checkpointer version. The pattern is: create StateGraph(AgentState), register nodes with add_node, connect them with add_edge and add_conditional_edges, then compile().
+The conditional edges (lines 61–68) are where the loop lives. add_conditional_edges takes: the source node name, the routing function, and a dict that maps the routing function's return values to node names. should_continue_research returns "continue_research" → maps to "researcher" (loops back). Returns "synthesize" → maps to "synthesizer" (exits loop).
+
+Then read build_graph_with_checkpointer() (lines 77–116). It's the same graph plus three lines: open a Postgres connection, create a PostgresSaver, pass it to compile(). That's all checkpointing is — a single argument to compile.
+
+What you should be able to answer:
+
+Draw the complete graph on paper with all nodes and edges, including the loop arrow.
+What does workflow.compile() return? (A runnable object you call .invoke() on.)
+What does thread_id in the config dict do for the checkpointer?
+If Researcher runs 4 times (for 4 questions), how many checkpoints get saved to Postgres?
+Phase 4 — Understand the async execution layer
+Goal: Understand why the workflow doesn't run inside FastAPI, and how Celery moves it to a background worker.
+
+Files to read, in this order:
+
+src/workers/celery_app.py — This is just configuration. Celery needs to know where its broker is (Redis), where to store results (also Redis), and which module contains the actual tasks. Read it to understand the options, especially task_acks_late and worker_prefetch_multiplier=1.
+src/workers/tasks.py — This is the bridge. Read the run_agent_workflow function (lines 37–125) and trace the 7 numbered steps in the comments. Step 1 loads the DB record. Step 2 marks it running. Step 3 builds the graph. Step 4 sets initial state. Step 5 sets the config. Step 6 calls graph.invoke() — this is the single line that runs the entire LangGraph pipeline. Step 7 saves the result. The except block handles failures and retries.
+Notice that graph.invoke() is a blocking call — it runs for 30–120 seconds. That's exactly why it must run in a Celery worker and not in the FastAPI request handler.
+
+What you should be able to answer:
+
+What is Redis's role here? (Broker: holds the task queue. Backend: stores task results.)
+What does .delay(run_id) do? (Pushes a message to Redis. Returns immediately. Does not run the function.)
+Why is conn.close() in a finally block?
+What happens if the worker crashes at step 6 (during graph.invoke()) and the run had checkpoints? What happens on retry?
+Phase 5 — Understand the API layer
+Goal: Understand how HTTP requests trigger the Celery task and how clients poll for results.
+
+Files to read:
+
+src/db/session.py — Short. Understand what get_session() does as a FastAPI dependency (it yields a session and guarantees cleanup via finally).
+src/api/schemas.py — Read all four Pydantic models. Notice CreateRunResponse has run_id and poll_url but no final_report — that's intentional, it's returned before the run completes. Notice RunDetail has final_report — that's what you get when polling.
+src/api/routes/runs.py — Focus on create_run (lines 30–58). It does three things: save to DB, call .delay(), return immediately. The HTTP response goes back to the client in under 100ms. The actual work happens later in a worker. Then read get_run (lines 79–100) — this is what the client polls. It reads from Postgres, which is updated by the Celery worker when complete.
+src/api/main.py — Understand the lifespan context manager. It runs init_db() on startup so tables are created automatically. Understand how routers are registered with include_router.
+What you should be able to answer:
+
+Trace a complete request: client sends POST /api/v1/runs → what happens in what order across which files?
+Why does create_run return HTTP 202 instead of 200?
+When the client polls GET /api/v1/runs/{id} and gets status: "running", where is that status coming from? (The AgentRun.status column in Postgres, updated by the Celery task in step 2 of run_agent_workflow.)
+Phase 6 — Understand the infrastructure
+Goal: Understand how everything is wired together in production.
+
+Files to read:
+
+src/config.py — Understand how pydantic-settings works: it reads environment variables and type-checks them at import time. Understand the two Postgres URL properties — why there are two formats (SQLAlchemy uses postgresql+psycopg://, LangGraph's psycopg uses postgresql://).
+docker-compose.yml — Read each service: postgres, redis, api, worker, flower. Notice api and worker use the same Docker image but different command values. Notice POSTGRES_HOST: postgres — this overrides the .env setting, pointing to the Docker container name instead of localhost. Notice the health checks on postgres and redis, and depends_on with condition: service_healthy.
+Makefile — Just read the targets. make up is the single command. make worker shows you what command starts a Celery worker locally.
+What you should be able to answer:
+
+Why do api and worker use the same Dockerfile but different commands?
+What does Flower do? (It's a web UI for monitoring Celery tasks.)
+Why does POSTGRES_HOST need to be overridden to postgres in the Docker environment?
+Phase 7 — Understand the tests
+Goal: See the system from the outside, and understand how to test each layer independently.
+
+Files to read:
+
+tests/test_nodes.py — Notice @patch("src.agents.nodes.ChatGoogleGenerativeAI"). This replaces the real LLM with a mock so tests don't make actual API calls. Understand make_state() — it creates a minimal valid AgentState for testing node functions in isolation.
+tests/test_api.py — Notice TestClient(app) — FastAPI's test client makes real HTTP requests against the app in-process. Notice that test_create_run mocks run_agent_workflow — tests shouldn't actually start Celery tasks. test_get_nonexistent_run tests the 404 path.
+tests/test_workflow.py — Tests that the graph compiles and has the right nodes. This verifies the wiring without running any agents.
+Implementation order if you were to rebuild this from scratch
+Once you've read everything, the correct order to build it would be:
+
+src/agents/state.py — Define the data. Nothing else can be written without knowing this.
+src/agents/nodes.py — Write the agents as plain functions. Test them manually.
+src/graphs/workflow.py — Wire the nodes into a graph. Test with build_graph().invoke(initial_state).
+src/db/models.py + src/db/session.py + src/db/init_db.py — Add persistence.
+src/workers/celery_app.py + src/workers/tasks.py — Wrap the graph in a background task.
+src/api/schemas.py + src/api/routes/ + src/api/main.py — Add the HTTP layer.
+src/config.py + .env.example — Externalize config.
+docker-compose.yml + Dockerfile + Makefile — Package for deployment.
+This order reflects the dependency chain: each layer depends only on what came before it.
+
+What to build yourself to prove understanding
+After reading, build these three things without looking at the code:
+
+A minimal two-node graph — START → node_a → node_b → END where node_a sets a field and node_b reads it. Run it with .invoke(). This proves you understand StateGraph, state, and nodes.
+
+Add a loop — Modify your graph so node_b loops back to node_a until a counter reaches 3. This proves you understand add_conditional_edges and routing functions.
+
+Wrap it in a Celery task — Spin up Redis locally, create a Celery task that runs your graph, call it with .delay(), print the result. This proves you understand the async execution pattern.
